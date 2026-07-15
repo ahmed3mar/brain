@@ -1,0 +1,177 @@
+name: Release
+
+# Builds brain from the source repo (SOURCE_REPO secret) at a tag via SOURCE_TOKEN,
+# publishes the GitHub release here, and updates the Homebrew tap. Triggered by the
+# source repo on tag push (workflow_dispatch), or manually.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: v-prefixed tag in the source repo to build and release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: arm64
+          - runner: macos-latest
+            goos: darwin
+            goarch: amd64
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout source at tag
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ref: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build release archive
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          if [[ -z "$version" || "$version" == "$RELEASE_TAG" ]]; then
+            echo "release builds require a v-prefixed tag" >&2
+            exit 1
+          fi
+          go build \
+            -trimpath \
+            -ldflags="-s -w -X main.brainVersion=${version}" \
+            -o brain ./cmd/brain
+          archive="brain-${GOOS}-${GOARCH}.tar.gz"
+          tar -czf "$archive" brain
+          shasum -a 256 "$archive"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brain-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: brain-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: brain-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum brain-*.tar.gz > checksums.txt
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* --title "$RELEASE_TAG" --generate-notes
+          fi
+
+  homebrew:
+    name: update homebrew tap
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Render + push formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TAP_TOKEN:-}" ]]; then
+            echo "HOMEBREW_TAP_GITHUB_TOKEN not set — skipping tap update" >&2
+            exit 0
+          fi
+          version="${RELEASE_TAG#v}"
+          base="https://github.com/ahmed3mar/brain/releases/download/${RELEASE_TAG}"
+
+          gh release download "$RELEASE_TAG" -R ahmed3mar/brain -p checksums.txt -O checksums.txt --clobber
+          sha() { grep "brain-$1.tar.gz" checksums.txt | awk '{print $1}'; }
+
+          cat > brain.rb <<EOF
+          class Brain < Formula
+            desc "Brain — collaborative terminal workspace TUI"
+            homepage "https://github.com/ahmed3mar/brain"
+            version "${version}"
+
+            on_macos do
+              on_arm do
+                url "${base}/brain-darwin-arm64.tar.gz"
+                sha256 "$(sha darwin-arm64)"
+              end
+              on_intel do
+                url "${base}/brain-darwin-amd64.tar.gz"
+                sha256 "$(sha darwin-amd64)"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${base}/brain-linux-arm64.tar.gz"
+                sha256 "$(sha linux-arm64)"
+              end
+              on_intel do
+                url "${base}/brain-linux-amd64.tar.gz"
+                sha256 "$(sha linux-amd64)"
+              end
+            end
+
+            def install
+              bin.install "brain"
+            end
+
+            test do
+              system "#{bin}/brain", "version"
+            end
+          end
+          EOF
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/ahmed3mar/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          mv brain.rb tap/Formula/brain.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/brain.rb
+          git commit -m "brain ${version}" || { echo "no formula change"; exit 0; }
+          git push
