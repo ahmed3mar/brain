@@ -20,6 +20,7 @@ env:
 jobs:
   build:
     name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    environment: production
     strategy:
       fail-fast: false
       matrix:
@@ -111,6 +112,7 @@ jobs:
     name: update homebrew tap
     needs: publish
     runs-on: ubuntu-latest
+    environment: production
     steps:
       - name: Render + push formula
         env:
