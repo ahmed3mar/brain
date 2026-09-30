@@ -86,13 +86,17 @@ jobs:
 
       - name: Test release binaries
         shell: bash
-        run: cargo check --locked --release --target "${{ matrix.target }}" -p brain-cli -p brain-tui -p brain-desktop
+        run: |
+          cargo check --locked --release --target "${{ matrix.target }}" \
+            -p brain-cli -p brain-desktop \
+            --bin brain --bin brain-tui --bin brain-desktop
 
       - name: Build release binaries
         shell: bash
         run: |
           cargo build --locked --release --target "${{ matrix.target }}" \
-            -p brain-cli -p brain-tui -p brain-desktop
+            -p brain-cli -p brain-desktop \
+            --bin brain --bin brain-tui --bin brain-desktop
 
       - name: Package CLI and desktop
         shell: bash
