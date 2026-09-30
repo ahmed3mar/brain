@@ -1,13 +1,12 @@
 name: Release
 
-# Builds brain from the source repo (SOURCE_REPO secret) at a tag via SOURCE_TOKEN,
-# publishes the GitHub release here, and updates the Homebrew tap. Triggered by the
-# source repo on tag push (workflow_dispatch), or manually.
+# This repository owns public artifacts. Source is checked out from the private
+# repository at the requested tag using SOURCE_TOKEN.
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: v-prefixed tag in the source repo to build and release
+        description: v-prefixed tag in brain-private to build and release
         required: true
         type: string
 
@@ -16,68 +15,138 @@ permissions:
 
 env:
   RELEASE_TAG: ${{ inputs.tag }}
+  SOURCE_REPO: ahmed3mar/brain-private
+  CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    name: build ${{ matrix.platform }}-${{ matrix.arch }}
     environment: production
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
-            goos: linux
-            goarch: amd64
-          - runner: ubuntu-latest
-            goos: linux
-            goarch: arm64
-          - runner: macos-latest
-            goos: darwin
-            goarch: amd64
-          - runner: macos-latest
-            goos: darwin
-            goarch: arm64
+          - runner: macos-15-intel
+            platform: macos
+            arch: x64
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - runner: macos-15
+            platform: macos
+            arch: arm64
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x64
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Checkout source at tag
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
+            echo "release tag must look like v1.2.3" >&2
+            exit 1
+          }
+
+      - name: Checkout private source at tag
         uses: actions/checkout@v5
         with:
-          repository: ${{ secrets.SOURCE_REPO }}
+          repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.RELEASE_TAG }}
           token: ${{ secrets.SOURCE_TOKEN }}
+          fetch-depth: 1
 
-      - uses: actions/setup-go@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version-file: go.mod
+          targets: ${{ matrix.target }}
 
-      - name: Test
-        run: go test ./...
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
 
-      - name: Build release archive
+      - name: Install Linux desktop dependencies
+        if: matrix.platform == 'linux'
         shell: bash
-        env:
-          CGO_ENABLED: "0"
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential clang cmake pkg-config libasound2-dev libfontconfig-dev \
+            libssl-dev libvulkan-dev libwayland-dev libxkbcommon-x11-dev
+
+      - name: Test release binaries
+        shell: bash
+        run: cargo check --locked --release --target "${{ matrix.target }}" -p brain-cli -p brain-tui -p brain-desktop
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          cargo build --locked --release --target "${{ matrix.target }}" \
+            -p brain-cli -p brain-tui -p brain-desktop
+
+      - name: Package CLI and desktop
+        shell: bash
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
-          if [[ -z "$version" || "$version" == "$RELEASE_TAG" ]]; then
-            echo "release builds require a v-prefixed tag" >&2
-            exit 1
+          target_dir="target/${{ matrix.target }}/release"
+          cli_name="brain-${version}-${{ matrix.platform }}-${{ matrix.arch }}"
+          desktop_name="brain-desktop-${version}-${{ matrix.platform }}-${{ matrix.arch }}"
+
+          mkdir -p "dist/${cli_name}" "dist/${desktop_name}"
+          cp "$target_dir/brain" "dist/${cli_name}/brain"
+          cp "$target_dir/brain-tui" "dist/${cli_name}/brain-tui"
+
+          if [[ "${{ matrix.platform }}" == "macos" ]]; then
+            app="dist/${desktop_name}/Brain.app"
+            mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+            cp "$target_dir/brain-desktop" "$app/Contents/MacOS/brain-desktop"
+            cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleDisplayName</key><string>Brain</string>
+            <key>CFBundleExecutable</key><string>brain-desktop</string>
+            <key>CFBundleIdentifier</key><string>dev.brain.desktop</string>
+            <key>CFBundleName</key><string>Brain</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${version}</string>
+            <key>CFBundleVersion</key><string>${version}</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          PLIST
+          else
+            cp "$target_dir/brain-desktop" "dist/${desktop_name}/brain-desktop"
+            cat > "dist/${desktop_name}/brain.desktop" <<DESKTOP
+          [Desktop Entry]
+          Type=Application
+          Name=Brain
+          Comment=Collaborative coding workspace
+          Exec=brain-desktop
+          Terminal=false
+          Categories=Development;
+          DESKTOP
           fi
-          go build \
-            -trimpath \
-            -ldflags="-s -w -X main.brainVersion=${version}" \
-            -o brain ./cmd/brain
-          archive="brain-${GOOS}-${GOARCH}.tar.gz"
-          tar -czf "$archive" brain
-          shasum -a 256 "$archive"
+
+          tar -C dist -czf "dist/${cli_name}.tar.gz" "$cli_name"
+          tar -C dist -czf "dist/${desktop_name}.tar.gz" "$desktop_name"
+          rm -rf "dist/${cli_name}" "dist/${desktop_name}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: brain-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: brain-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          name: release-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/*.tar.gz
           if-no-files-found: error
 
   publish:
@@ -89,83 +158,84 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: brain-*
+          pattern: release-*
           path: dist
           merge-multiple: true
 
       - name: Create checksums
         working-directory: dist
-        run: sha256sum brain-*.tar.gz > checksums.txt
+        run: sha256sum *.tar.gz > checksums.txt
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # -R avoids needing a checked-out git repo (this job only downloads artifacts).
           repo="${{ github.repository }}"
           if gh release view "$RELEASE_TAG" -R "$repo" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/* -R "$repo" --clobber
           else
-            gh release create "$RELEASE_TAG" dist/* -R "$repo" --title "$RELEASE_TAG" --generate-notes
+            gh release create "$RELEASE_TAG" dist/* -R "$repo" \
+              --title "$RELEASE_TAG" --generate-notes
           fi
 
   homebrew:
-    name: update homebrew tap
+    name: update Homebrew tap
     needs: publish
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - name: Render + push formula
+      - name: Render and push formula
         env:
           GH_TOKEN: ${{ github.token }}
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if [[ -z "${TAP_TOKEN:-}" ]]; then
-            echo "HOMEBREW_TAP_GITHUB_TOKEN not set — skipping tap update" >&2
+            echo "HOMEBREW_TAP_GITHUB_TOKEN is not set; skipping tap update" >&2
             exit 0
           fi
           version="${RELEASE_TAG#v}"
-          base="https://github.com/ahmed3mar/brain/releases/download/${RELEASE_TAG}"
-
-          gh release download "$RELEASE_TAG" -R ahmed3mar/brain -p checksums.txt -O checksums.txt --clobber
-          sha() { grep "brain-$1.tar.gz" checksums.txt | awk '{print $1}'; }
+          base="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}"
+          gh release download "$RELEASE_TAG" -R "${{ github.repository }}" \
+            -p checksums.txt -O checksums.txt --clobber
+          sha() { grep "brain-${version}-$1.tar.gz" checksums.txt | awk '{print $1}'; }
 
           cat > brain.rb <<EOF
           class Brain < Formula
-            desc "Brain — collaborative terminal workspace TUI"
+            desc "Collaborative coding workspace CLI and TUI"
             homepage "https://github.com/ahmed3mar/brain"
             version "${version}"
 
             on_macos do
               on_arm do
-                url "${base}/brain-darwin-arm64.tar.gz"
-                sha256 "$(sha darwin-arm64)"
+                url "${base}/brain-${version}-macos-arm64.tar.gz"
+                sha256 "$(sha macos-arm64)"
               end
               on_intel do
-                url "${base}/brain-darwin-amd64.tar.gz"
-                sha256 "$(sha darwin-amd64)"
+                url "${base}/brain-${version}-macos-x64.tar.gz"
+                sha256 "$(sha macos-x64)"
               end
             end
 
             on_linux do
               on_arm do
-                url "${base}/brain-linux-arm64.tar.gz"
+                url "${base}/brain-${version}-linux-arm64.tar.gz"
                 sha256 "$(sha linux-arm64)"
               end
               on_intel do
-                url "${base}/brain-linux-amd64.tar.gz"
-                sha256 "$(sha linux-amd64)"
+                url "${base}/brain-${version}-linux-x64.tar.gz"
+                sha256 "$(sha linux-x64)"
               end
             end
 
             def install
               bin.install "brain"
+              bin.install "brain-tui"
             end
 
             test do
-              system "#{bin}/brain", "version"
+              assert_match version.to_s, shell_output("#{bin}/brain --version")
             end
           end
           EOF
