@@ -1,10 +1,10 @@
 # Brain
 
-Brain is a collaborative coding workspace with a command-line interface, terminal UI, and desktop application.
+Brain is a collaborative coding workspace with a command-line interface and desktop application. The terminal UI is built into the `brain` command.
 
 The public repository hosts downloads and release automation. Application source is maintained separately.
 
-## Install the CLI and TUI
+## Install Brain
 
 ### Homebrew
 
@@ -12,10 +12,7 @@ The public repository hosts downloads and release automation. Application source
 brew install ahmed3mar/tap/brain
 ```
 
-This installs:
-
-- `brain` — the main CLI and interactive terminal workspace
-- `brain-tui` — the standalone terminal UI
+This installs `brain`, including its interactive terminal workspace.
 
 ### Release archives
 
@@ -26,7 +23,7 @@ Download the archive for your platform from the [latest release](https://github.
 - Linux ARM64 (`linux-arm64`)
 - Linux x86-64 (`linux-x64`)
 
-Each `brain-<version>-<platform>-<arch>.tar.gz` archive contains both `brain` and `brain-tui`.
+Each `brain-<version>-<platform>-<arch>.tar.gz` archive contains the `brain` executable.
 
 ## Install the desktop application
 

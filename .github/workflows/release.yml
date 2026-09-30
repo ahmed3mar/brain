@@ -89,14 +89,14 @@ jobs:
         run: |
           cargo check --locked --release --target "${{ matrix.target }}" \
             -p brain-cli -p brain-desktop \
-            --bin brain --bin brain-tui --bin brain-desktop
+            --bin brain --bin brain-desktop
 
       - name: Build release binaries
         shell: bash
         run: |
           cargo build --locked --release --target "${{ matrix.target }}" \
             -p brain-cli -p brain-desktop \
-            --bin brain --bin brain-tui --bin brain-desktop
+            --bin brain --bin brain-desktop
 
       - name: Package CLI and desktop
         shell: bash
@@ -109,7 +109,6 @@ jobs:
 
           mkdir -p "dist/${cli_name}" "dist/${desktop_name}"
           cp "$target_dir/brain" "dist/${cli_name}/brain"
-          cp "$target_dir/brain-tui" "dist/${cli_name}/brain-tui"
 
           if [[ "${{ matrix.platform }}" == "macos" ]]; then
             app="dist/${desktop_name}/Brain.app"
@@ -207,7 +206,7 @@ jobs:
 
           cat > brain.rb <<EOF
           class Brain < Formula
-            desc "Collaborative coding workspace CLI and TUI"
+            desc "Collaborative coding workspace"
             homepage "https://github.com/ahmed3mar/brain"
             version "${version}"
 
@@ -235,7 +234,6 @@ jobs:
 
             def install
               bin.install "brain"
-              bin.install "brain-tui"
             end
 
             test do
