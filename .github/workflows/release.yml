@@ -87,6 +87,19 @@ jobs:
             libglib2.0-dev libgtk-3-dev libssl-dev libvulkan-dev libwayland-dev \
             libwebkit2gtk-4.1-dev libxkbcommon-x11-dev
 
+      # The source stays at its placeholder version; the binaries report the
+      # release tag (`brain --version`, About, the updater's comparison).
+      - name: Stamp the release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          sed -i.bak '/^\[workspace.package\]/,/^\[/ s/^version = ".*"/version = "'"$version"'"/' Cargo.toml
+          rm Cargo.toml.bak
+          grep -A4 '^\[workspace.package\]' Cargo.toml | grep -qx "version = \"$version\""
+          cargo update --workspace
+          git diff --stat
+
       - name: Build release binaries
         shell: bash
         run: |
