@@ -6,8 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: v-prefixed tag in brain-private to build and release
+        description: v-prefixed tag in brain-private to build and release (created if missing)
         required: true
+        type: string
+      ref:
+        description: brain-private branch or commit to tag when the tag does not exist yet
+        required: false
+        default: main
         type: string
 
 permissions:
@@ -19,8 +24,40 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Validates the tag and, if brain-private does not have it yet, tags `ref`
+  # there first (SOURCE_TOKEN needs Contents: write on brain-private for that).
+  tag:
+    name: ensure source tag
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
+            echo "release tag must look like v1.2.3" >&2
+            exit 1
+          }
+
+      - name: Create the tag in brain-private if missing
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          SOURCE_REF: ${{ inputs.ref || 'main' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh api "repos/$SOURCE_REPO/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "$RELEASE_TAG already exists in $SOURCE_REPO"
+            exit 0
+          fi
+          sha="$(gh api "repos/$SOURCE_REPO/commits/$SOURCE_REF" --jq .sha)"
+          gh api "repos/$SOURCE_REPO/git/refs" -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$sha" >/dev/null
+          echo "Tagged $SOURCE_REPO@$SOURCE_REF ($sha) as $RELEASE_TAG"
+
   build:
     name: build ${{ matrix.platform }}-${{ matrix.arch }}
+    needs: tag
     environment: production
     strategy:
       fail-fast: false
@@ -50,15 +87,6 @@ jobs:
             archive: tar.gz
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Validate release tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
-            echo "release tag must look like v1.2.3" >&2
-            exit 1
-          }
-
       - name: Checkout private source at tag
         uses: actions/checkout@v5
         with:
