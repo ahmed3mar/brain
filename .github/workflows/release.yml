@@ -202,6 +202,32 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Plan 46's update feed: `brain-<target>.tar.gz` with `brain` at the top,
+      # and `latest.json` naming them with their sha256. Workers updated from
+      # Brain Cloud, ssh remotes and the cloud's "latest version" read it.
+      - name: Server archives and latest.json
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          base="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}"
+          server='{}'
+          for pair in macos-arm64:aarch64-apple-darwin macos-x64:x86_64-apple-darwin \
+            linux-arm64:aarch64-unknown-linux-musl linux-x64:x86_64-unknown-linux-musl; do
+            platform="${pair%%:*}" triple="${pair#*:}"
+            src="brain-${version}-${platform}.tar.gz"
+            [[ -f "$src" ]] || continue
+            unpack="$(mktemp -d)"
+            tar -xzf "$src" -C "$unpack"
+            tar -C "$unpack/brain-${version}-${platform}" -czf "brain-${triple}.tar.gz" brain
+            rm -rf "$unpack"
+            sha="$(sha256sum "brain-${triple}.tar.gz" | awk '{print $1}')"
+            server="$(jq -c --arg t "$triple" --arg url "${base}/brain-${triple}.tar.gz" --arg sha "$sha" \
+              '. + {($t): {url: $url, sha256: $sha}}' <<<"$server")"
+          done
+          jq -n --arg v "$version" --argjson server "$server" '{version: $v, assets: {}, server: $server}' > latest.json
+          cat latest.json
+
       - name: Create checksums
         working-directory: dist
         run: sha256sum *.tar.gz > checksums.txt
