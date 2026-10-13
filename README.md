@@ -143,7 +143,13 @@ Desktop downloads are published separately as `brain-desktop-<version>-<platform
 
 4. Open **Brain** from Finder or Spotlight.
 
-The initial application bundles are unsigned. On first launch, macOS may require you to right-click **Brain**, choose **Open**, and confirm.
+If macOS says **"Brain" is damaged and can't be opened**, that release is not notarized yet and the browser quarantined the download. Choose **Cancel** (not Move to Trash) and clear the quarantine flag:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Brain.app
+```
+
+Downloads made with `curl` are not quarantined and open directly.
 
 ### Linux desktop
 

@@ -149,12 +149,89 @@ jobs:
           cargo update --workspace
           git diff --stat
 
-      - name: Build release binaries
+      # Optional Developer ID signing. Without MACOS_CERTIFICATE_P12 the app is
+      # ad-hoc signed: it runs, but a browser-downloaded copy is quarantined and
+      # Gatekeeper reports it as "damaged" until `xattr -dr
+      # com.apple.quarantine Brain.app`. The .p12 is a Developer ID Application
+      # certificate with its private key, base64-encoded.
+      - name: Import the Developer ID certificate
+        id: signing
+        if: matrix.platform == 'macos'
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         shell: bash
         run: |
-          cargo build --locked --release --target "${{ matrix.target }}" \
-            -p brain-cli -p brain-desktop \
-            --bin brain --bin brain-desktop
+          set -euo pipefail
+          if [[ -z "${CERT_P12:-}" ]]; then
+            echo "::warning::MACOS_CERTIFICATE_P12 is not set; Brain.app is ad-hoc signed and not notarized"
+            echo "identity=-" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(openssl rand -hex 16)"
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity="$(security find-identity -v -p codesigning "$keychain" |
+            sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -n 1)"
+          [[ -n "$identity" ]] || { echo "the certificate holds no Developer ID Application identity" >&2; exit 1; }
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+
+      # macOS: scripts/bundle-macos.sh (the source's own bundler) builds both
+      # binaries and assembles Brain.app: the `brain` daemon beside the app,
+      # icon, Info.plist and a signature that seals them.
+      - name: Build release binaries
+        shell: bash
+        env:
+          BRAIN_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.platform }}" == "macos" ]]; then
+            CARGO_BUILD_TARGET="${{ matrix.target }}" scripts/bundle-macos.sh
+          else
+            cargo build --locked --release --target "${{ matrix.target }}" \
+              -p brain-cli -p brain-desktop \
+              --bin brain --bin brain-desktop
+          fi
+
+      # Notarizing needs an App Store Connect API key (Developer role): the .p8
+      # contents, its key id and its issuer id. The ticket is stapled into the
+      # bundle, so Gatekeeper accepts it offline too.
+      - name: Notarize Brain.app
+        if: matrix.platform == 'macos' && steps.signing.outputs.identity != '-'
+        env:
+          API_KEY: ${{ secrets.APPLE_API_KEY_P8 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${API_KEY:-}" && -n "${API_KEY_ID:-}" && -n "${API_ISSUER_ID:-}" ]] || {
+            echo "Developer ID signing is set up, so APPLE_API_KEY_P8, APPLE_API_KEY_ID and APPLE_API_ISSUER_ID are required" >&2
+            exit 1
+          }
+          app="target/${{ matrix.target }}/release/Brain.app"
+          key="$RUNNER_TEMP/notary.p8"
+          printf '%s\n' "$API_KEY" > "$key"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/Brain.zip"
+          result="$(xcrun notarytool submit "$RUNNER_TEMP/Brain.zip" \
+            --key "$key" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" \
+            --wait --output-format json)"
+          echo "$result"
+          if [[ "$(jq -r .status <<<"$result")" != Accepted ]]; then
+            xcrun notarytool log "$(jq -r .id <<<"$result")" \
+              --key "$key" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" || true
+            exit 1
+          fi
+          rm "$key"
+          xcrun stapler staple "$app"
+          spctl --assess --type execute -vv "$app"
 
       - name: Package CLI and desktop
         shell: bash
@@ -166,28 +243,15 @@ jobs:
           desktop_name="brain-desktop-${version}-${{ matrix.platform }}-${{ matrix.arch }}"
 
           mkdir -p "dist/${cli_name}" "dist/${desktop_name}"
-          cp "$target_dir/brain" "dist/${cli_name}/brain"
 
           if [[ "${{ matrix.platform }}" == "macos" ]]; then
-            app="dist/${desktop_name}/Brain.app"
-            mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-            cp "$target_dir/brain-desktop" "$app/Contents/MacOS/brain-desktop"
-            cat > "$app/Contents/Info.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>CFBundleDisplayName</key><string>Brain</string>
-            <key>CFBundleExecutable</key><string>brain-desktop</string>
-            <key>CFBundleIdentifier</key><string>dev.brain.desktop</string>
-            <key>CFBundleName</key><string>Brain</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>${version}</string>
-            <key>CFBundleVersion</key><string>${version}</string>
-            <key>LSMinimumSystemVersion</key><string>12.0</string>
-            <key>NSHighResolutionCapable</key><true/>
-          </dict></plist>
-          PLIST
+            # The signed (and possibly stapled) bundle, copied without changes:
+            # any byte added after signing breaks its seal.
+            cp "target/${{ matrix.target }}/release-cli/brain" "dist/${cli_name}/brain"
+            ditto "$target_dir/Brain.app" "dist/${desktop_name}/Brain.app"
+            codesign --verify --strict "dist/${desktop_name}/Brain.app"
           else
+            cp "$target_dir/brain" "dist/${cli_name}/brain"
             cp "$target_dir/brain-desktop" "dist/${desktop_name}/brain-desktop"
             cat > "dist/${desktop_name}/brain.desktop" <<DESKTOP
           [Desktop Entry]
@@ -200,8 +264,9 @@ jobs:
           DESKTOP
           fi
 
-          tar -C dist -czf "dist/${cli_name}.tar.gz" "$cli_name"
-          tar -C dist -czf "dist/${desktop_name}.tar.gz" "$desktop_name"
+          # COPYFILE_DISABLE: no AppleDouble `._*` files, which break the seal.
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/${cli_name}.tar.gz" "$cli_name"
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/${desktop_name}.tar.gz" "$desktop_name"
           rm -rf "dist/${cli_name}" "dist/${desktop_name}"
 
       - uses: actions/upload-artifact@v4
