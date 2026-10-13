@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: v-prefixed tag in brain-private to build and release (created if missing)
-        required: true
+        description: v-prefixed release tag (leave blank to increment the latest public patch version)
+        required: false
         type: string
       ref:
         description: brain-private branch or commit to tag when the tag does not exist yet
@@ -30,18 +30,37 @@ jobs:
     name: ensure source tag
     runs-on: ubuntu-latest
     environment: production
+    outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
     steps:
-      - name: Validate release tag
+      - name: Resolve and validate release tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
+          if [[ -z "$RELEASE_TAG" ]]; then
+            tags="$(gh api --paginate "repos/${{ github.repository }}/tags?per_page=100" --jq '.[].name')"
+            latest="$(printf '%s\n' "$tags" | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -n 1)"
+            if [[ -z "$latest" ]]; then
+              echo "No stable public version tag found; provide an explicit release tag" >&2
+              exit 1
+            fi
+            prefix="${latest%.*}"
+            patch="${latest##*.}"
+            RELEASE_TAG="$prefix.$((10#$patch + 1))"
+            echo "Next release tag: $RELEASE_TAG (latest: $latest)"
+          fi
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
             echo "release tag must look like v1.2.3" >&2
             exit 1
           }
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Create the tag in brain-private if missing
         env:
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
           GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
           SOURCE_REF: ${{ inputs.ref || 'main' }}
         shell: bash
@@ -58,6 +77,8 @@ jobs:
   build:
     name: build ${{ matrix.platform }}-${{ matrix.arch }}
     needs: tag
+    env:
+      RELEASE_TAG: ${{ needs.tag.outputs.release_tag }}
     environment: production
     strategy:
       fail-fast: false
@@ -191,7 +212,9 @@ jobs:
 
   publish:
     name: publish GitHub release
-    needs: build
+    needs: [tag, build]
+    env:
+      RELEASE_TAG: ${{ needs.tag.outputs.release_tag }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -247,7 +270,9 @@ jobs:
 
   homebrew:
     name: update Homebrew tap
-    needs: publish
+    needs: [tag, publish]
+    env:
+      RELEASE_TAG: ${{ needs.tag.outputs.release_tag }}
     runs-on: ubuntu-latest
     environment: production
     steps:
