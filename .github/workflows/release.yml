@@ -22,6 +22,10 @@ env:
   RELEASE_TAG: ${{ inputs.tag }}
   SOURCE_REPO: ahmed3mar/brain-private
   CARGO_TERM_COLOR: always
+  # Pinned so a new stable Rust does not change rust-cache's key prefix and
+  # force a from-scratch build of every target. RUSTUP_TOOLCHAIN overrides the
+  # source's rust-toolchain.toml (`channel = "stable"`). Bump deliberately.
+  RUSTUP_TOOLCHAIN: "1.99.1"
 
 jobs:
   # Validates the tag and, if brain-private does not have it yet, tags `ref`
@@ -117,8 +121,9 @@ jobs:
           fetch-depth: 1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo build
